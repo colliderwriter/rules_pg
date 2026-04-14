@@ -1,0 +1,77 @@
+load("@rules_pg//:defs.bzl", "pg_test", "pg_seed_data", "postgres_schema")
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+postgres_schema(
+    name = "test_schema",
+    srcs = [
+        "schema/001_init.sql",
+        "schema/002_tags.sql",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Seed data
+# ---------------------------------------------------------------------------
+
+pg_seed_data(
+    name = "test_seed",
+    schema = ":test_schema",
+    srcs = ["seed/seed.sql"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: schema only (no seed)
+# ---------------------------------------------------------------------------
+
+pg_test(
+    name = "schema_smoke_test",
+    srcs = ["schema_smoke_test.sh"],
+    schema = ":test_schema",
+    size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: schema + seed
+# ---------------------------------------------------------------------------
+
+pg_test(
+    name = "seed_smoke_test",
+    srcs = ["seed_smoke_test.sh"],
+    schema = ":test_schema",
+    seed = ":test_seed",
+    size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: explicit PG version
+# ---------------------------------------------------------------------------
+
+pg_test(
+    name = "pg16_smoke_test",
+    srcs = ["schema_smoke_test.sh"],
+    schema = ":test_schema",
+    postgres_version = "16",
+    size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: custom database name + credentials
+# ---------------------------------------------------------------------------
+
+pg_test(
+    name = "custom_db_test",
+    srcs = ["seed_smoke_test.sh"],
+    schema = ":test_schema",
+    seed = ":test_seed",
+    database = "myapp_test",
+    pg_user = "myapp",
+    pg_password = "secret",
+    size = "medium",
+    tags = ["pg"],
+)

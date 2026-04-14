@@ -1,0 +1,4 @@
+toolchain_type(
+    name = "postgres",
+    visibility = ["//visibility:public"],
+)

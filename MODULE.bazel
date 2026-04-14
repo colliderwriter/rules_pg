@@ -1,0 +1,15 @@
+module(
+    name = "rules_pg",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.5.0")
+bazel_dep(name = "platforms", version = "0.0.9")
+
+# Register the module extension that downloads pg binaries.
+pg = use_extension("//:extensions.bzl", "pg")
+pg.version(versions = ["14", "15", "16"])
+use_repo(pg, "pg_14_linux_amd64", "pg_14_darwin_arm64", "pg_14_darwin_amd64")
+use_repo(pg, "pg_15_linux_amd64", "pg_15_darwin_arm64", "pg_15_darwin_amd64")
+use_repo(pg, "pg_16_linux_amd64", "pg_16_darwin_arm64", "pg_16_darwin_amd64")

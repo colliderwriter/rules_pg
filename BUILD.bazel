@@ -1,0 +1,31 @@
+load("//private:binary.bzl", "postgres_binary")
+
+# ---------------------------------------------------------------------------
+# Default postgres_binary targets for each supported version.
+# These are what postgres_schema and pg_test point to when the user doesn't
+# specify an explicit binary.
+# ---------------------------------------------------------------------------
+
+[
+    postgres_binary(
+        name = "pg_" + version,
+        version = version,
+        binary = select({
+            "@platforms//os:linux": "@pg_{}_linux_amd64//:pg_bins".format(version),
+            "@platforms//os:macos": select({
+                "@platforms//cpu:aarch64": "@pg_{}_darwin_arm64//:pg_bins".format(version),
+                "//conditions:default":    "@pg_{}_darwin_amd64//:pg_bins".format(version),
+            }),
+        }),
+        visibility = ["//visibility:public"],
+    )
+    for version in ["14", "15", "16"]
+]
+
+# Alias for the default version (14).  postgres_schema points here when the
+# user doesn't set binary= explicitly.
+alias(
+    name = "pg_default",
+    actual = ":pg_14",
+    visibility = ["//visibility:public"],
+)
