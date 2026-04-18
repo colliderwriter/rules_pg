@@ -20,7 +20,15 @@ workspace(name = "rules_pg")
 #   load("@rules_pg//:repositories.bzl", "rules_pg_register_toolchains")
 #   rules_pg_register_toolchains()
 
-load("//:repositories.bzl", "rules_pg_dependencies", "rules_pg_register_toolchains")
+load("//:repositories.bzl", "pg_system_dependencies", "rules_pg_register_toolchains")
 
-rules_pg_dependencies()
-rules_pg_register_toolchains()
+# Use system-installed PostgreSQL instead of downloading from the CDN.
+# Switch back to rules_pg_dependencies() once real SHA-256 checksums are
+# pinned in repositories.bzl and the EnterpriseDB CDN is reachable.
+pg_system_dependencies(
+    versions = ["14", "15", "16"],
+    # bin_dir and lib_dir are auto-detected via pg_config / PATH if omitted.
+)
+# rules_pg_register_toolchains() omitted: toolchain targets in
+# //toolchain/BUILD.bazel are not yet declared; the pg_test macro
+# uses postgres_binary directly and does not require toolchain resolution.

@@ -67,9 +67,21 @@ _PLATFORMS = ["linux_amd64", "darwin_arm64", "darwin_amd64"]
 _BUILD_TMPL = """
 load("@rules_pg//private:binary.bzl", "postgres_binary_files")
 
+filegroup(
+    name = "all_bin_files",
+    srcs = glob(["bin/*"]),
+)
+
+filegroup(
+    name = "all_lib_files",
+    srcs = glob(["lib/**"]),
+)
+
 postgres_binary_files(
     name = "pg_bins",
     version = "{version}",
+    bins = [":all_bin_files"],
+    libs = [":all_lib_files"],
     visibility = ["//visibility:public"],
 )
 
@@ -79,6 +91,108 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 """
+
+def _pg_system_binary_repo_impl(rctx):
+    """Symlinks a system-installed PostgreSQL into an external repo."""
+    bin_dir = rctx.attr.bin_dir
+    lib_dir = rctx.attr.lib_dir
+    pg_version = rctx.attr.pg_version
+
+    # Auto-detect bin_dir if not provided.
+    if not bin_dir:
+        res = rctx.execute(["sh", "-c", "command -v pg_ctl 2>/dev/null || true"])
+        path = res.stdout.strip()
+        if path:
+            bin_dir = path.rsplit("/", 1)[0]
+        else:
+            for candidate in ["/usr/bin", "/usr/local/bin", "/usr/local/pgsql/bin",
+                               "/opt/homebrew/bin", "/opt/local/bin"]:
+                res = rctx.execute(["test", "-x", candidate + "/pg_ctl"])
+                if res.return_code == 0:
+                    bin_dir = candidate
+                    break
+
+    if not bin_dir:
+        fail(
+            "\nrules_pg: pg_system_dependencies() — could not locate pg_ctl.\n" +
+            "Either install PostgreSQL or pass bin_dir = '/path/to/pg/bin'.\n"
+        )
+
+    # Verify required binaries exist and are executable.
+    required = ["pg_ctl", "initdb", "psql", "pg_isready"]
+    missing = []
+    for b in required:
+        res = rctx.execute(["test", "-x", bin_dir + "/" + b])
+        if res.return_code != 0:
+            missing.append(bin_dir + "/" + b)
+    if missing:
+        fail(
+            "\nrules_pg: pg_system_dependencies() — required binaries missing:\n  " +
+            "\n  ".join(missing) + "\n"
+        )
+
+    # Auto-detect lib_dir if not provided.
+    if not lib_dir:
+        pg_config = bin_dir + "/pg_config"
+        res = rctx.execute(["sh", "-c", '"' + pg_config + '" --libdir 2>/dev/null || true'])
+        lib_dir = res.stdout.strip()
+        if not lib_dir:
+            res = rctx.execute(["sh", "-c",
+                "find /usr/lib64 /usr/lib /usr/local/lib" +
+                " /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu" +
+                " -name 'libpq.so*' -maxdepth 2 2>/dev/null | head -1 || true"])
+            libpq = res.stdout.strip()
+            if libpq:
+                lib_dir = libpq.rsplit("/", 1)[0]
+
+    rctx.execute(["mkdir", "-p", "bin", "lib"])
+    for b in ["pg_ctl", "initdb", "psql", "pg_isready", "pg_dump", "postgres"]:
+        src = bin_dir + "/" + b
+        result = rctx.execute(["test", "-f", src])
+        if result.return_code == 0:
+            rctx.symlink(src, "bin/" + b)
+
+    if lib_dir:
+        result = rctx.execute(["sh", "-c",
+            "find " + lib_dir + " -maxdepth 1 -name 'libpq*.so*' 2>/dev/null"])
+        for lib_path in result.stdout.splitlines():
+            lib_path = lib_path.strip()
+            if lib_path:
+                rctx.symlink(lib_path, "lib/" + lib_path.split("/")[-1])
+
+    rctx.file("BUILD.bazel", _BUILD_TMPL.format(version = pg_version))
+
+_pg_system_binary_repo = repository_rule(
+    implementation = _pg_system_binary_repo_impl,
+    attrs = {
+        "pg_version": attr.string(mandatory = True),
+        "bin_dir":    attr.string(default = ""),
+        "lib_dir":    attr.string(default = ""),
+    },
+)
+
+def pg_system_dependencies(versions = None, bin_dir = "", lib_dir = ""):
+    """Create external repos backed by a system-installed PostgreSQL.
+
+    Use this instead of rules_pg_dependencies() when the EnterpriseDB CDN is
+    unreachable (air-gapped CI, sandboxes, …).
+
+    Args:
+        versions: list of version strings. Default ["14"].
+        bin_dir:  directory containing pg_ctl, initdb, psql, … Default "/usr/bin".
+        lib_dir:  directory containing libpq shared libraries. Default "".
+    """
+    versions = versions or ["14"]
+    for version in versions:
+        for platform in _PLATFORMS:
+            name = "pg_{}_{}".format(version, platform)
+            if not native.existing_rule(name):
+                _pg_system_binary_repo(
+                    name = name,
+                    pg_version = version,
+                    bin_dir = bin_dir,
+                    lib_dir = lib_dir,
+                )
 
 def rules_pg_dependencies(versions = None):
     """Download pre-built PostgreSQL tarballs.

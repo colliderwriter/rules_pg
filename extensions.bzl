@@ -73,19 +73,32 @@ _PG_VERSIONS = {
 _PLATFORMS = ["linux_amd64", "darwin_arm64", "darwin_amd64"]
 
 # ---------------------------------------------------------------------------
-# BUILD template injected into each downloaded repo
+# BUILD template injected into each repo (downloaded or system)
 # ---------------------------------------------------------------------------
 
 _BUILD_TMPL = """
 load("@rules_pg//private:binary.bzl", "postgres_binary_files")
 
+# Filegroups consumed by postgres_binary_files defaults.
+filegroup(
+    name = "all_bin_files",
+    srcs = glob(["bin/*"]),
+)
+
+filegroup(
+    name = "all_lib_files",
+    srcs = glob(["lib/**"]),
+)
+
 postgres_binary_files(
     name = "pg_bins",
     version = "{version}",
+    bins = [":all_bin_files"],
+    libs = [":all_lib_files"],
     visibility = ["//visibility:public"],
 )
 
-# Also expose raw filegroups for advanced users.
+# Also expose the full tree for advanced users.
 filegroup(
     name = "all_files",
     srcs = glob(["bin/**", "lib/**", "share/**"]),
@@ -93,12 +106,15 @@ filegroup(
 )
 """
 
+# ---------------------------------------------------------------------------
+# Repository rule: downloaded pre-built tarball
+# ---------------------------------------------------------------------------
+
 def _pg_binary_repo_impl(rctx):
-    spec = rctx.attr.spec
     rctx.download_and_extract(
-        url = spec.url,
-        sha256 = spec.sha256,
-        stripPrefix = spec.strip_prefix,
+        url = rctx.attr.url,
+        sha256 = rctx.attr.sha256,
+        stripPrefix = rctx.attr.strip_prefix,
     )
     rctx.file(
         "BUILD.bazel",
@@ -108,13 +124,107 @@ def _pg_binary_repo_impl(rctx):
 _pg_binary_repo = repository_rule(
     implementation = _pg_binary_repo_impl,
     attrs = {
+        "pg_version":    attr.string(mandatory = True),
+        "platform":      attr.string(mandatory = True),
+        "url":           attr.string(mandatory = True),
+        "sha256":        attr.string(mandatory = True),
+        "strip_prefix":  attr.string(default = ""),
+    },
+)
+
+# ---------------------------------------------------------------------------
+# Repository rule: system-installed PostgreSQL (no download required)
+#
+# Symlinks the binaries and libraries from a system installation into an
+# external repo that has the same layout as a downloaded tarball, so that
+# the rest of the rule machinery is unchanged.
+#
+# Use pg.system() in MODULE.bazel instead of pg.version() when network
+# access to the EnterpriseDB CDN is unavailable (CI air-gap, sandboxes, …).
+# ---------------------------------------------------------------------------
+
+def _pg_system_binary_repo_impl(rctx):
+    bin_dir = rctx.attr.bin_dir
+    lib_dir = rctx.attr.lib_dir
+    pg_version = rctx.attr.pg_version
+
+    # Auto-detect bin_dir if not provided.
+    if not bin_dir:
+        res = rctx.execute(["sh", "-c", "command -v pg_ctl 2>/dev/null || true"])
+        path = res.stdout.strip()
+        if path:
+            bin_dir = path.rsplit("/", 1)[0]
+        else:
+            for candidate in ["/usr/bin", "/usr/local/bin", "/usr/local/pgsql/bin",
+                               "/opt/homebrew/bin", "/opt/local/bin"]:
+                res = rctx.execute(["test", "-x", candidate + "/pg_ctl"])
+                if res.return_code == 0:
+                    bin_dir = candidate
+                    break
+
+    if not bin_dir:
+        fail(
+            "\nrules_pg: pg.system() — could not locate pg_ctl.\n" +
+            "Either install PostgreSQL (e.g. 'apt install postgresql-server-dev-all')\n" +
+            "or pass bin_dir = '/path/to/pg/bin' to pg.system().\n"
+        )
+
+    # Verify required binaries exist and are executable.
+    required = ["pg_ctl", "initdb", "psql", "pg_isready"]
+    missing = []
+    for b in required:
+        res = rctx.execute(["test", "-x", bin_dir + "/" + b])
+        if res.return_code != 0:
+            missing.append(bin_dir + "/" + b)
+    if missing:
+        fail(
+            "\nrules_pg: pg.system() — required binaries missing or not executable:\n  " +
+            "\n  ".join(missing) + "\n" +
+            "Ensure PostgreSQL is fully installed and binaries are in " + bin_dir + "\n"
+        )
+
+    # Auto-detect lib_dir if not provided.
+    if not lib_dir:
+        pg_config = bin_dir + "/pg_config"
+        res = rctx.execute(["sh", "-c", '"' + pg_config + '" --libdir 2>/dev/null || true'])
+        lib_dir = res.stdout.strip()
+        if not lib_dir:
+            res = rctx.execute(["sh", "-c",
+                "find /usr/lib64 /usr/lib /usr/local/lib" +
+                " /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu" +
+                " -name 'libpq.so*' -maxdepth 2 2>/dev/null | head -1 || true"])
+            libpq = res.stdout.strip()
+            if libpq:
+                lib_dir = libpq.rsplit("/", 1)[0]
+
+    # Create the same bin/ + lib/ directory structure as a downloaded tarball.
+    rctx.execute(["mkdir", "-p", "bin", "lib"])
+
+    for b in ["pg_ctl", "initdb", "psql", "pg_isready", "pg_dump", "postgres"]:
+        src = bin_dir + "/" + b
+        result = rctx.execute(["test", "-f", src])
+        if result.return_code == 0:
+            rctx.symlink(src, "bin/" + b)
+
+    # Symlink top-level shared libraries so LD_LIBRARY_PATH in the launcher
+    # finds them.  Only follow the immediate directory (not subdirs) to avoid
+    # pulling in PostgreSQL extension .so files that we don't need.
+    if lib_dir:
+        result = rctx.execute(["sh", "-c",
+            "find " + lib_dir + " -maxdepth 1 -name 'libpq*.so*' 2>/dev/null"])
+        for lib_path in result.stdout.splitlines():
+            lib_path = lib_path.strip()
+            if lib_path:
+                rctx.symlink(lib_path, "lib/" + lib_path.split("/")[-1])
+
+    rctx.file("BUILD.bazel", _BUILD_TMPL.format(version = pg_version))
+
+_pg_system_binary_repo = repository_rule(
+    implementation = _pg_system_binary_repo_impl,
+    attrs = {
         "pg_version": attr.string(mandatory = True),
-        "platform": attr.string(mandatory = True),
-        "spec": attr.label(mandatory = False),  # passed as a struct via tag
-        # We carry the struct fields directly instead:
-        "url": attr.string(mandatory = True),
-        "sha256": attr.string(mandatory = True),
-        "strip_prefix": attr.string(default = ""),
+        "bin_dir":    attr.string(default = "/usr/bin"),
+        "lib_dir":    attr.string(default = ""),
     },
 )
 
@@ -126,24 +236,52 @@ _version_tag = tag_class(attrs = {
     "versions": attr.string_list(default = ["14"]),
 })
 
+_system_tag = tag_class(attrs = {
+    "versions": attr.string_list(default = ["14"]),
+    "bin_dir":  attr.string(default = ""),
+    "lib_dir":  attr.string(default = ""),
+})
+
 def _pg_extension_impl(module_ctx):
-    requested = {}
+    # Collect system-binary overrides keyed by version.
+    system_cfg = {}
+    for mod in module_ctx.modules:
+        for tag in mod.tags.system:
+            for v in tag.versions:
+                system_cfg[v] = {"bin_dir": tag.bin_dir, "lib_dir": tag.lib_dir}
+
+    # Collect requested download versions (skipped if a system override exists).
+    download_versions = {}
     for mod in module_ctx.modules:
         for tag in mod.tags.version:
             for v in tag.versions:
-                requested[v] = True
+                if v not in system_cfg:
+                    download_versions[v] = True
 
-    for version in requested.keys():
+    # Validate all versions.
+    for version in list(system_cfg.keys()) + list(download_versions.keys()):
         if version not in _PG_VERSIONS:
             fail("Unsupported PostgreSQL version: {}. Supported: {}".format(
                 version,
                 ", ".join(_PG_VERSIONS.keys()),
             ))
+
+    # Create system repos.
+    for version, cfg in system_cfg.items():
+        for platform in _PLATFORMS:
+            _pg_system_binary_repo(
+                name = "pg_{}_{}".format(version, platform),
+                pg_version = version,
+                bin_dir = cfg["bin_dir"],
+                lib_dir = cfg["lib_dir"],
+            )
+
+    # Create download repos.
+    for version in download_versions.keys():
         for platform in _PLATFORMS:
             spec = _PG_VERSIONS[version][platform]
-            repo_name = "pg_{}_{}".format(version, platform)
             _pg_binary_repo(
-                name = repo_name,
+                name = "pg_{}_{}".format(version, platform),
                 pg_version = version,
                 platform = platform,
                 url = spec.url,
@@ -153,5 +291,8 @@ def _pg_extension_impl(module_ctx):
 
 pg = module_extension(
     implementation = _pg_extension_impl,
-    tag_classes = {"version": _version_tag},
+    tag_classes = {
+        "version": _version_tag,
+        "system":  _system_tag,
+    },
 )

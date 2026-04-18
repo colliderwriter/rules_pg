@@ -48,14 +48,67 @@ pg_test(
 )
 
 # ---------------------------------------------------------------------------
-# Tests: explicit PG version
+# Tests: explicit PG versions (14, 15, 16)
 # ---------------------------------------------------------------------------
+
+pg_test(
+    name = "pg14_smoke_test",
+    srcs = ["schema_smoke_test.sh"],
+    schema = ":test_schema",
+    postgres_version = "14",
+    size = "medium",
+    tags = ["pg"],
+)
+
+pg_test(
+    name = "pg15_smoke_test",
+    srcs = ["schema_smoke_test.sh"],
+    schema = ":test_schema",
+    postgres_version = "15",
+    size = "medium",
+    tags = ["pg"],
+)
 
 pg_test(
     name = "pg16_smoke_test",
     srcs = ["schema_smoke_test.sh"],
     schema = ":test_schema",
     postgres_version = "16",
+    size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: verify PostgreSQL binary is installed and functional
+# ---------------------------------------------------------------------------
+
+pg_test(
+    name = "pg_binary_test",
+    srcs = ["pg_binary_test.sh"],
+    schema = ":test_schema",
+    size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# Seed data: CSV-based loading
+# ---------------------------------------------------------------------------
+
+pg_seed_data(
+    name = "csv_seed",
+    schema = ":test_schema",
+    srcs = ["seed/tags.csv"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: CSV seed loading
+# ---------------------------------------------------------------------------
+
+pg_test(
+    name = "csv_seed_test",
+    srcs = ["csv_seed_test.sh"],
+    schema = ":test_schema",
+    seed = ":csv_seed",
     size = "medium",
     tags = ["pg"],
 )

@@ -7,9 +7,16 @@ module(
 bazel_dep(name = "bazel_skylib", version = "1.5.0")
 bazel_dep(name = "platforms", version = "0.0.9")
 
-# Register the module extension that downloads pg binaries.
+# Register the module extension that provides pg binaries.
+#
+# pg.system() uses the host-installed PostgreSQL instead of downloading
+# pre-built tarballs.  Switch back to pg.version() once real SHA-256
+# checksums are pinned in extensions.bzl and the CDN is reachable.
 pg = use_extension("//:extensions.bzl", "pg")
-pg.version(versions = ["14", "15", "16"])
+pg.system(
+    versions = ["14", "15", "16"],
+    # bin_dir and lib_dir are auto-detected via pg_config / PATH if omitted.
+)
 use_repo(pg, "pg_14_linux_amd64", "pg_14_darwin_arm64", "pg_14_darwin_amd64")
 use_repo(pg, "pg_15_linux_amd64", "pg_15_darwin_arm64", "pg_15_darwin_amd64")
 use_repo(pg, "pg_16_linux_amd64", "pg_16_darwin_arm64", "pg_16_darwin_amd64")

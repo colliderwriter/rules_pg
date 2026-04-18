@@ -23,6 +23,7 @@ def _pg_launcher_impl(ctx):
 
     # Write a small JSON manifest so the launcher doesn't need to parse argv.
     manifest_content = struct(
+        workspace   = ctx.workspace_name,
         pgctl       = binary_info.pgctl.short_path,
         initdb      = binary_info.initdb.short_path,
         psql        = binary_info.psql.short_path,
@@ -51,9 +52,17 @@ def _pg_launcher_impl(ctx):
         content   = """\
 #!/usr/bin/env bash
 set -euo pipefail
-export RULES_PG_MANIFEST="$0.runfiles/{workspace}/{manifest}"
-export RULES_PG_TEST_BINARY="$0.runfiles/{workspace}/{test_bin}"
-exec "$0.runfiles/{workspace}/{launcher}" "$@"
+# Bazel sets TEST_SRCDIR to the runfiles root for all test targets.
+# Do not use $0.runfiles — in sandboxed execution $0 resolves to the
+# symlink inside the runfiles tree, which would double-nest the path.
+RUNFILES_ROOT="${{TEST_SRCDIR:-${{RUNFILES_DIR:-}}}}"
+if [[ -z "$RUNFILES_ROOT" ]]; then
+  echo "[rules_pg] Neither TEST_SRCDIR nor RUNFILES_DIR is set" >&2
+  exit 1
+fi
+export RULES_PG_MANIFEST="$RUNFILES_ROOT/{workspace}/{manifest}"
+export RULES_PG_TEST_BINARY="$RUNFILES_ROOT/{workspace}/{test_bin}"
+exec "$RUNFILES_ROOT/{workspace}/{launcher}" "$@"
 """.format(
             workspace = ctx.workspace_name,
             manifest  = manifest.short_path,
@@ -75,7 +84,7 @@ exec "$0.runfiles/{workspace}/{launcher}" "$@"
         ),
     ]
 
-_pg_launcher = rule(
+_pg_launcher_test = rule(
     implementation = _pg_launcher_impl,
     test = True,
     doc = "Internal rule. Use the pg_test macro instead.",
@@ -170,7 +179,7 @@ def pg_test(
     )
 
     # 2. Wrap it with the pg launcher.
-    _pg_launcher(
+    _pg_launcher_test(
         name    = name,
         schema  = schema,
         seed    = seed,

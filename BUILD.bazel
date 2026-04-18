@@ -1,6 +1,23 @@
 load("//private:binary.bzl", "postgres_binary")
 
 # ---------------------------------------------------------------------------
+# Platform config_settings used by postgres_binary select()s below.
+# Flat (non-nested) selects are required; Bazel does not allow select-in-select.
+# ---------------------------------------------------------------------------
+
+[
+    config_setting(
+        name = cfg_name,
+        constraint_values = constraints,
+    )
+    for cfg_name, constraints in [
+        ("_pg_linux_amd64",  ["@platforms//os:linux",  "@platforms//cpu:x86_64"]),
+        ("_pg_darwin_arm64", ["@platforms//os:macos",  "@platforms//cpu:aarch64"]),
+        ("_pg_darwin_amd64", ["@platforms//os:macos",  "@platforms//cpu:x86_64"]),
+    ]
+]
+
+# ---------------------------------------------------------------------------
 # Default postgres_binary targets for each supported version.
 # These are what postgres_schema and pg_test point to when the user doesn't
 # specify an explicit binary.
@@ -11,11 +28,9 @@ load("//private:binary.bzl", "postgres_binary")
         name = "pg_" + version,
         version = version,
         binary = select({
-            "@platforms//os:linux": "@pg_{}_linux_amd64//:pg_bins".format(version),
-            "@platforms//os:macos": select({
-                "@platforms//cpu:aarch64": "@pg_{}_darwin_arm64//:pg_bins".format(version),
-                "//conditions:default":    "@pg_{}_darwin_amd64//:pg_bins".format(version),
-            }),
+            ":_pg_linux_amd64":  "@pg_{}_linux_amd64//:pg_bins".format(version),
+            ":_pg_darwin_arm64": "@pg_{}_darwin_arm64//:pg_bins".format(version),
+            ":_pg_darwin_amd64": "@pg_{}_darwin_amd64//:pg_bins".format(version),
         }),
         visibility = ["//visibility:public"],
     )

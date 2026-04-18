@@ -5,6 +5,20 @@
 
 set -euo pipefail
 
+require_env() {
+    local var="$1"
+    if [[ -z "${!var:-}" ]]; then
+        echo "ERROR: required environment variable \$${var} is not set" >&2
+        echo "       This script must be run via 'bazel test', not directly." >&2
+        exit 1
+    fi
+}
+require_env PGHOST
+require_env PGPORT
+require_env PGDATABASE
+require_env PGUSER
+require_env PGPASSWORD
+
 psql() {
     PGPASSWORD="$PGPASSWORD" command psql \
         -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
