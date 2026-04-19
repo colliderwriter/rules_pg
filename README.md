@@ -20,7 +20,10 @@ parallelism is safe.
   - [postgres\_schema](#postgres_schema)
   - [pg\_seed\_data](#pg_seed_data)
   - [pg\_test](#pg_test)
+  - [pg\_server](#pg_server)
+  - [pg\_health\_check](#pg_health_check)
   - [postgres\_binary](#postgres_binary)
+- [rules\_itest integration](#rules_itest-integration)
 - [Providers](#providers)
   - [PostgresBinaryInfo](#postgresbinaryinfo)
   - [PostgresSchemaInfo](#postgresschemainfo)
@@ -44,7 +47,7 @@ parallelism is safe.
 Add to your `MODULE.bazel`:
 
 ```python
-bazel_dep(name = "rules_pg", version = "0.1.0")
+bazel_dep(name = "rules_pg", version = "0.2.0")
 
 pg = use_extension("@rules_pg//:extensions.bzl", "pg")
 
@@ -321,6 +324,78 @@ pg_test(
 
 ---
 
+### `pg_server`
+
+```python
+load("@rules_pg//:defs.bzl", "pg_server")
+
+pg_server(
+    name = "...",
+    schema = ":schema",
+    seed = None,
+    postgres_version = "14",
+    database = "test",
+    pg_user = "postgres",
+    pg_password = "postgres",
+)
+```
+
+Produces a long-running executable that starts an ephemeral PostgreSQL cluster,
+waits until it is fully initialized (schema and seed applied), and then blocks
+until it receives `SIGTERM` or `SIGINT`. Designed for use with
+[`rules_itest`](https://github.com/dzbarsky/rules_itest) or any other service
+manager that runs services alongside integration tests.
+
+**Readiness protocol.** After the cluster is ready, `pg_server` writes
+`$TEST_TMPDIR/<name>.env` containing the `PGHOST`, `PGPORT`, `PGDATABASE`,
+`PGUSER`, and `PGPASSWORD` variables. The file is written atomically (via a
+`.tmp` rename) so readers never observe a partial write. Its mere existence
+signals that the cluster is fully up and ready to accept connections.
+
+**Shutdown.** `SIGTERM` (sent by `rules_itest` after the test) and `SIGINT`
+(for interactive `bazel run` sessions) both call `pg_ctl stop -m fast` then
+exit 0.
+
+**Attributes:** same as `pg_test` except `srcs`, `deps`, `size`, `timeout`,
+`tags`, and `test_rule` are absent (it is not a test target).
+
+| Attribute | Type | Default | Description |
+|---|---|---|---|
+| `name` | `string` | required | Target name. Also used as the env file stem: `$TEST_TMPDIR/<name>.env`. |
+| `schema` | `label` | required | `postgres_schema` target to apply on startup. |
+| `seed` | `label` | `None` | Optional `pg_seed_data` target loaded after migrations. |
+| `postgres_version` | `string` | `"14"` | PostgreSQL major version. |
+| `database` | `string` | `"test"` | Name of the database to create. |
+| `pg_user` | `string` | `"postgres"` | Database superuser name. |
+| `pg_password` | `string` | `"postgres"` | Database superuser password. |
+
+---
+
+### `pg_health_check`
+
+```python
+load("@rules_pg//:defs.bzl", "pg_health_check")
+
+pg_health_check(
+    name = "...",
+    server = ":my_server",
+)
+```
+
+Generates a companion health-check binary for a `pg_server` target. When
+invoked it exits `0` if and only if `$TEST_TMPDIR/<server-name>.env` exists,
+and exits non-zero otherwise. This matches the contract expected by
+`rules_itest`'s `health_check` attribute.
+
+**Attributes:**
+
+| Attribute | Type | Default | Description |
+|---|---|---|---|
+| `name` | `string` | required | Target name. |
+| `server` | `label` | required | The `pg_server` target this check monitors. |
+
+---
+
 ### `postgres_binary`
 
 ```python
@@ -358,6 +433,124 @@ postgres_schema(
     binary = "@rules_pg//:pg_16",
 )
 ```
+
+---
+
+## `rules_itest` integration
+
+[`rules_itest`](https://github.com/dzbarsky/rules_itest) is a Bazel extension
+for integration tests that models the test run as: start services in dependency
+order → run test → stop services. `pg_server` and `pg_health_check` map
+directly onto this model.
+
+### Installation
+
+Add `rules_itest` to your `MODULE.bazel`:
+
+```python
+bazel_dep(name = "rules_itest", version = "0.0.21")
+```
+
+### Example
+
+The following example starts a PostgreSQL service, waits until it is healthy,
+then runs an integration test that connects to it.
+
+**`BUILD.bazel`:**
+
+```python
+load("@rules_pg//:defs.bzl", "pg_health_check", "pg_server", "postgres_schema", "pg_seed_data")
+load("@rules_itest//:itest.bzl", "itest_service", "service_test")
+
+postgres_schema(
+    name = "schema",
+    srcs = glob(["migrations/*.sql"]),
+)
+
+pg_seed_data(
+    name = "fixtures",
+    schema = ":schema",
+    srcs = ["fixtures/users.sql"],
+)
+
+# Long-running service: starts pg, writes $TEST_TMPDIR/db.env when ready.
+pg_server(
+    name = "db",
+    schema = ":schema",
+    seed = ":fixtures",
+)
+
+# Health probe: exits 0 once $TEST_TMPDIR/db.env exists.
+pg_health_check(
+    name = "db_health",
+    server = ":db",
+)
+
+# rules_itest service wrapper with health check.
+itest_service(
+    name = "db_svc",
+    exe = ":db",
+    health_check = ":db_health",
+)
+
+# Integration test that runs after db_svc is healthy.
+service_test(
+    name = "integration_test",
+    services = [":db_svc"],
+    test = ":integration_test_bin",
+)
+
+sh_test(
+    name = "integration_test_bin",
+    srcs = ["integration_test.sh"],
+    tags = ["manual"],
+)
+```
+
+**`integration_test.sh`:**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Source the connection details written by pg_server.
+# shellcheck disable=SC1090
+source "$TEST_TMPDIR/db.env"
+
+# The standard PG* variables are now set; connect with any client.
+PGPASSWORD="$PGPASSWORD" psql \
+    -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+    --no-password -v ON_ERROR_STOP=1 \
+    -c "SELECT COUNT(*) FROM users;"
+
+echo "PASS"
+```
+
+Run with:
+
+```
+bazel test //:integration_test
+```
+
+`rules_itest` starts `db_svc`, polls `db_health` until it returns 0, runs
+`integration_test_bin`, then sends `SIGTERM` to `db_svc`. `pg_server` handles
+`SIGTERM` by calling `pg_ctl stop -m fast` and exiting 0.
+
+### Connection details
+
+The `$TEST_TMPDIR/<server-name>.env` file contains standard `libpq` variables:
+
+```
+PGHOST=127.0.0.1
+PGPORT=54321
+PGDATABASE=test
+PGUSER=postgres
+PGPASSWORD=postgres
+```
+
+Any client that respects `libpq` environment variables — `psql`, `pgx`,
+`psycopg2`, `database/sql` with a `pgx` driver — connects without any
+additional configuration after sourcing this file.
 
 ---
 

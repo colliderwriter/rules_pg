@@ -327,7 +327,9 @@ rules_itest service manager
 bazel test //tests/...
 ```
 
-All tests must pass before any commit is made.
+All tests must pass before any commit with code changes.
+
+All documentation (`README.md`, `DESIGN.md`, `CLAUDE.md`) must be updated to reflect any code changes before committing. This includes new rules, changed attributes, new public API surface, and behaviour changes.
 
 ### Test results (last full run: 2026-04-18)
 
