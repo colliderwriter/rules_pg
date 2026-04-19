@@ -18,7 +18,8 @@ rules_pg/
 │   ├── schema.bzl            # postgres_schema rule + PostgresSchemaInfo provider
 │   ├── seed.bzl              # pg_seed_data rule + PostgresSeedInfo provider
 │   ├── test.bzl              # pg_test macro + _pg_launcher_test rule
-│   └── launcher.py           # Test launcher: initdb → migrate → seed → exec → teardown
+│   ├── server.bzl            # pg_server rule + pg_health_check rule
+│   └── launcher.py           # Shared launcher: initdb → migrate → seed → (exec test | serve)
 ├── toolchain/
 │   └── toolchain.bzl         # Toolchain type + register helpers
 └── tests/
@@ -35,7 +36,7 @@ rules_pg/
 PostgresBinaryInfo
   └─ PostgresSchemaInfo   (carries a PostgresBinaryInfo)
        └─ PostgresSeedInfo  (carries a PostgresSchemaInfo)
-            └─ consumed by pg_test launcher
+            └─ consumed by pg_test and pg_server
 ```
 
 ### `pg_test` isolation model
@@ -104,7 +105,13 @@ PostgreSQL version than what was declared in `postgres_version =`.
 ## Public API
 
 ```python
-load("@rules_pg//defs.bzl", "pg_test", "postgres_schema", "pg_seed_data")
+load("@rules_pg//defs.bzl",
+    "pg_test",
+    "pg_server",
+    "pg_health_check",
+    "postgres_schema",
+    "pg_seed_data",
+)
 
 postgres_schema(
     name = "my_schema",
@@ -118,6 +125,7 @@ pg_seed_data(
     srcs = ["seed.sql"],          # .sql or .csv files; mixed lists are fine
 )
 
+# Single-binary test (schema + seed applied, test binary exec'd directly):
 pg_test(
     name = "my_test",
     srcs = ["my_test.go"],
@@ -130,7 +138,47 @@ pg_test(
     test_rule = go_test,            # optional; default native.sh_test
     deps = [...],
 )
+
+# Long-running service (for rules_itest and multi-service orchestration):
+pg_server(
+    name = "my_db",
+    schema = ":my_schema",          # required
+    seed = ":my_seed",              # optional
+    database = "testdb",            # optional, default "test"
+    pg_user = "postgres",           # optional
+    pg_password = "postgres",       # optional
+)
+
+# Health-check binary for rules_itest (exits 0 when my_db is fully ready):
+pg_health_check(
+    name = "my_db_health",
+    server = ":my_db",
+)
 ```
+
+### `pg_server` readiness protocol
+
+`pg_server` writes `$TEST_TMPDIR/<name>.env` atomically once the cluster is
+fully ready — after initdb, server start, migrations, and seed data. The file
+contains the standard `PG*` variables, one per line:
+
+```
+PGHOST=127.0.0.1
+PGPORT=54321
+PGDATABASE=testdb
+PGUSER=postgres
+PGPASSWORD=postgres
+```
+
+Tests that depend on the server source this file:
+
+```bash
+source "$TEST_TMPDIR/my_db.env"
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c "SELECT 1"
+```
+
+`pg_server` stops the cluster cleanly on SIGTERM (sent by rules_itest after the
+test) or SIGINT (Ctrl-C during `bazel run`).
 
 ### MODULE.bazel (Bzlmod)
 
@@ -160,6 +208,117 @@ load("@rules_pg//:repositories.bzl", "pg_system_dependencies")
 pg_system_dependencies(versions = ["14", "15", "16"])
 ```
 
+## Integration with rules_itest
+
+`pg_server` and `pg_health_check` are designed to slot directly into
+[rules_itest](https://github.com/dzbarsky/rules_itest) for multi-service
+integration tests — e.g., testing an HTTP API that requires a database.
+
+### Example: HTTP API integration test
+
+```
+myapp/
+├── BUILD.bazel
+├── migrations/
+│   ├── 001_init.sql
+│   └── 002_users.sql
+├── seed/
+│   └── test_users.sql
+└── api_test.sh
+```
+
+```python
+# myapp/BUILD.bazel
+load("@rules_pg//defs.bzl", "postgres_schema", "pg_seed_data", "pg_server", "pg_health_check")
+load("@rules_itest//:defs.bzl", "itest_service", "service_test")
+
+postgres_schema(
+    name = "schema",
+    srcs = glob(["migrations/*.sql"]),
+)
+
+pg_seed_data(
+    name = "seed",
+    schema = ":schema",
+    srcs = ["seed/test_users.sql"],
+)
+
+pg_server(
+    name = "db",
+    schema = ":schema",
+    seed = ":seed",
+)
+
+pg_health_check(
+    name = "db_health",
+    server = ":db",
+)
+
+itest_service(
+    name = "db_svc",
+    exe          = ":db",
+    health_check = ":db_health",
+)
+
+itest_service(
+    name = "api_svc",
+    exe  = "//myapp/server:bin",
+    # Your server reads PG* env vars or sources $TEST_TMPDIR/db.env on startup.
+    # Declare a dep so rules_itest starts the database before the API server:
+    deps = [":db_svc"],
+    http_health_check_address = "http://127.0.0.1:${PORT}/healthz",
+    autoassign_port = True,
+)
+
+service_test(
+    name     = "api_test",
+    test     = ":api_test_bin",
+    services = [":db_svc", ":api_svc"],
+)
+
+sh_test(
+    name = "api_test_bin",
+    srcs = ["api_test.sh"],
+    data = ["@curl//:bin"],
+    tags = ["manual"],
+)
+```
+
+```bash
+# myapp/api_test.sh
+set -euo pipefail
+
+# Source database connection details written by pg_server.
+source "$TEST_TMPDIR/db.env"
+
+# rules_itest exposes service ports via ASSIGNED_PORTS.
+API_PORT=$(echo "$ASSIGNED_PORTS" | python3 -c "
+import json, sys
+ports = json.load(sys.stdin)
+print(ports['//myapp:api_svc'])
+")
+API_URL="http://127.0.0.1:${API_PORT}"
+
+# Verify the API can query the seeded database.
+result=$(curl -sf "${API_URL}/users")
+echo "$result" | grep -q "alice"
+
+echo "PASS"
+```
+
+### Lifecycle under rules_itest
+
+```
+rules_itest service manager
+  ├── starts :db_svc         (pg_server: initdb → migrate → seed → write env file)
+  │     polls :db_health     (exits 0 when $TEST_TMPDIR/db.env exists)
+  ├── starts :api_svc        (your HTTP service, reads PG* from env file or its own init)
+  │     polls /healthz
+  └── runs :api_test_bin     (sources env file, hits HTTP API)
+  └── sends SIGTERM to all services
+        :db_svc → pg_ctl stop -m fast
+```
+
 ## Development
 
 ### Running the self-tests
@@ -170,18 +329,20 @@ bazel test //tests/...
 
 ### Test results (last full run: 2026-04-18)
 
-All 8 tests passed in ~8 s on Linux x86_64 with PostgreSQL 18.3 system install.
+All 10 tests pass on Linux x86_64 with PostgreSQL 18.3 system install.
 
-| Test target                  | What it verifies                                        | Result |
-|------------------------------|---------------------------------------------------------|--------|
-| `//tests:schema_smoke_test`  | Schema migrations applied; DDL/DML round-trip           | PASSED |
-| `//tests:seed_smoke_test`    | SQL seed data loaded; referential integrity join        | PASSED |
-| `//tests:pg14_smoke_test`    | pg_test macro with `postgres_version = "14"`            | PASSED |
-| `//tests:pg15_smoke_test`    | pg_test macro with `postgres_version = "15"`            | PASSED |
-| `//tests:pg16_smoke_test`    | pg_test macro with `postgres_version = "16"`            | PASSED |
-| `//tests:pg_binary_test`     | PG binary present, version ≥ 14, DDL/DML, ROLLBACK     | PASSED |
-| `//tests:csv_seed_test`      | CSV seed loading via `\copy`; exact row counts          | PASSED |
-| `//tests:custom_db_test`     | Custom `database =` and `pg_user =` attributes          | PASSED |
+| Test target                    | What it verifies                                                        | Result |
+|--------------------------------|-------------------------------------------------------------------------|--------|
+| `//tests:schema_smoke_test`    | Schema migrations applied; DDL/DML round-trip                           | PASSED |
+| `//tests:seed_smoke_test`      | SQL seed data loaded; referential integrity join                        | PASSED |
+| `//tests:pg14_smoke_test`      | pg_test macro with `postgres_version = "14"`                            | PASSED |
+| `//tests:pg15_smoke_test`      | pg_test macro with `postgres_version = "15"`                            | PASSED |
+| `//tests:pg16_smoke_test`      | pg_test macro with `postgres_version = "16"`                            | PASSED |
+| `//tests:pg_binary_test`       | PG binary present, version ≥ 14, DDL/DML, ROLLBACK                     | PASSED |
+| `//tests:csv_seed_test`        | CSV seed loading via `\copy`; exact row counts                          | PASSED |
+| `//tests:custom_db_test`       | Custom `database =` and `pg_user =` attributes                          | PASSED |
+| `//tests:pg_server_test`       | pg_server start, env file, schema+seed, SIGTERM clean shutdown          | PASSED |
+| `//tests:pg_health_check_test` | pg_health_check exits non-zero without env file, 0 when file is present | PASSED |
 
 ### Adding a new Postgres version
 
@@ -192,7 +353,16 @@ All 8 tests passed in ~8 s on Linux x86_64 with PostgreSQL 18.3 system install.
 
 ### Launcher script
 
-`private/launcher.py` is the heart of `pg_test`. It:
+`private/launcher.py` is the heart of both `pg_test` and `pg_server`. The mode
+is selected by the `RULES_PG_MODE` environment variable (set by the generated
+wrapper script):
+
+| Mode | Set by | Behaviour |
+|---|---|---|
+| `test` (default) | `pg_test` wrapper | `_pg_setup` → `os.execve(test_binary)` |
+| `server` | `pg_server` wrapper | `_pg_setup` → write env file → `signal.pause()` until SIGTERM/SIGINT |
+
+Both modes share `_pg_setup`, which:
 
 1. Reads the JSON manifest written by the Bazel rule (`RULES_PG_MANIFEST`).
 2. Resolves all runfile paths (external repos use `../repo/path`; workspace files use `<workspace>/path`).
@@ -204,8 +374,10 @@ All 8 tests passed in ~8 s on Linux x86_64 with PostgreSQL 18.3 system install.
 8. Polls `pg_isready` until the server accepts connections (max 15 s).
 9. Retries startup on port conflicts only; fails immediately on all other errors.
 10. Creates the test database, applies migrations in order, loads seed data.
-11. `os.execve`s the wrapped test binary with `PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD` set.
-12. `atexit` handler runs `pg_ctl stop -m fast` on exit.
+11. Returns a `_PgState` dataclass with connection details.
+
+After `_pg_setup`, test mode calls `os.execve` with `PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD`
+set; server mode writes `$TEST_TMPDIR/<name>.env` and blocks.
 
 ### Test script requirements
 
@@ -232,3 +404,6 @@ All test shell scripts must:
 - Downloaded tarball SHA-256 checksums in `extensions.bzl`/`repositories.bzl`
   are placeholder values. Run `tools/update_checksums.sh` (not yet implemented)
   to pin real values before enabling `pg.version()`.
+- `pg_server` target names must be unique within a test run. Two `pg_server`
+  targets with the same local name in different packages would write to the same
+  `$TEST_TMPDIR/<name>.env` path.

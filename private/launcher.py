@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-rules_pg test launcher.
+rules_pg launcher.
 
-Reads RULES_PG_MANIFEST (JSON), spins up an ephemeral Postgres cluster,
-applies migrations + seed data, then exec's the test binary with PG* env vars.
+Two modes, selected by RULES_PG_MODE (default: "test"):
 
-Never imported; always exec'd by the wrapper shell script.
+  test   — initdb → migrate → seed → exec test binary; atexit stop (best-effort)
+  server — initdb → migrate → seed → write env file → block until SIGTERM/SIGINT → stop
+
+Never imported; always exec'd by a wrapper shell script.
 """
 
 import atexit
+import dataclasses
 import json
 import os
 import platform
-import shutil
 import signal
 import socket
 import subprocess
@@ -39,23 +41,18 @@ def _find_runfile(rel_path: str, workspace: str = "") -> str:
     """
     runfiles_dir = os.environ.get("RUNFILES_DIR") or (sys.argv[0] + ".runfiles")
 
-    # Build candidate list.
     candidates = []
     if rel_path.startswith("../"):
-        # External repo: strip "../" and look directly under the runfiles root.
         candidates.append(os.path.join(runfiles_dir, rel_path[3:]))
     else:
-        # Workspace-local file: lives under <root>/<workspace>/<path>.
         if workspace:
             candidates.append(os.path.join(runfiles_dir, workspace, rel_path))
-        # Fallback without workspace prefix (e.g. when running outside sandbox).
         candidates.append(os.path.join(runfiles_dir, rel_path))
 
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
 
-    # Last resort: RUNFILES_MANIFEST_FILE (used in some execution modes).
     manifest_file = os.environ.get("RUNFILES_MANIFEST_FILE", "")
     if manifest_file and os.path.exists(manifest_file):
         with open(manifest_file) as f:
@@ -180,23 +177,39 @@ def _psql(psql_bin: str, host: str, port: int, user: str, database: str,
 def _copy_csv(psql_bin: str, host: str, port: int, user: str, database: str,
               password: str, csv_path: str, lib_dir: str = "") -> None:
     table = os.path.splitext(os.path.basename(csv_path))[0]
-    # Use \copy (client-side) so the file path is local to the test runner.
     sql = rf"\copy {table} FROM '{csv_path}' CSV HEADER"
     _psql(psql_bin, host, port, user, database, password, sql=sql, lib_dir=lib_dir)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Runtime state
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    # -- Read manifest -------------------------------------------------------
-    manifest_path = os.environ.get("RULES_PG_MANIFEST")
-    if not manifest_path:
-        sys.exit("[rules_pg] RULES_PG_MANIFEST not set")
-    with open(manifest_path) as f:
-        m = json.load(f)
+@dataclasses.dataclass
+class _PgState:
+    pgdata:      str
+    pg_log:      str
+    pg_ctl:      str
+    pg_lib_dir:  str
+    host:        str
+    port:        int
+    database:    str
+    pg_user:     str
+    pg_password: str
+    psql:        str
 
+
+# ---------------------------------------------------------------------------
+# pg_setup: initdb → start → migrate → seed → return _PgState
+# ---------------------------------------------------------------------------
+
+def _pg_setup(m: dict) -> _PgState:
+    """Spin up an ephemeral PostgreSQL cluster from a manifest dict.
+
+    Performs initdb, tunes postgresql.conf, starts the server (with retry on
+    port conflicts), creates the database, applies migrations in order, and
+    loads seed data.  Returns a _PgState describing the running cluster.
+    """
     workspace   = m.get("workspace", "")
     pg_ctl      = _find_runfile(m["pgctl"], workspace)
     initdb_bin  = _find_runfile(m["initdb"], workspace)
@@ -209,42 +222,26 @@ def main() -> None:
     pg_user     = m.get("pg_user", "postgres")
     pg_password = m.get("pg_password", "postgres")
 
-    # Derive the bundled lib/ directory from the pg_ctl path so shared
-    # libraries (libpq, etc.) are found without a system-wide install.
     pg_lib_dir = os.path.join(os.path.dirname(os.path.dirname(pg_ctl)), "lib")
 
-    # Ensure all PostgreSQL binaries are executable.  Zip-based archives
-    # (macOS) don't always preserve execute bits; tar.gz usually does, but
-    # this is a cheap safety net.
     for bin_path in (pg_ctl, initdb_bin, psql_bin, pg_isready):
         _ensure_executable(bin_path)
 
-    # Detect the actual binary version at runtime.  --socket-fd was added in
-    # PG 14 and removed in PG 18, so we must check the real binary rather than
-    # trusting the manifest's declared version (which reflects the *requested*
-    # version, not the binary that happens to be installed on this host).
     actual_pg_version = _pg_major_version(pg_ctl, pg_lib_dir)
     if actual_pg_version == 0:
-        # Fall back to the manifest-declared version if detection fails.
         actual_pg_version = pg_version
     _log(f"Detected PostgreSQL binary version: {actual_pg_version}")
 
-    # -- Workspace -----------------------------------------------------------
     test_tmpdir = os.environ.get("TEST_TMPDIR") or tempfile.mkdtemp(prefix="rules_pg_")
     pgdata = os.path.join(test_tmpdir, "pgdata")
     pg_log = os.path.join(test_tmpdir, "pg.log")
     os.makedirs(pgdata, exist_ok=True)
-    # initdb requires the data directory to be mode 0700 (not world-readable).
-    # os.makedirs() respects the process umask, so we set the mode explicitly.
     os.chmod(pgdata, 0o700)
 
-    # -- Port allocation -----------------------------------------------------
     host = "127.0.0.1"
     port, reserved_sock = _allocate_port()
-    # --socket-fd is supported in PG 14–17; it was removed in PG 18.
     use_socket_fd = 14 <= actual_pg_version <= 17 and reserved_sock is not None
 
-    # -- initdb --------------------------------------------------------------
     _log(f"Running initdb in {pgdata}")
     subprocess.run(
         [
@@ -262,7 +259,6 @@ def main() -> None:
         env=_pg_env(pg_lib_dir),
     )
 
-    # Tune postgresql.conf for a fast ephemeral server.
     conf_path = os.path.join(pgdata, "postgresql.conf")
     with open(conf_path, "a") as cf:
         cf.write("\n# rules_pg ephemeral overrides\n")
@@ -273,34 +269,13 @@ def main() -> None:
         cf.write("full_page_writes = off\n")
         cf.write("log_min_messages = WARNING\n")
         cf.write("log_min_error_statement = ERROR\n")
-        # Force all output to stderr so pg_ctl's -l file captures it.
-        # PostgreSQL ≥ 15 defaults logging_collector to on, which redirects
-        # logs to pgdata/log/ and makes our -l file nearly empty.
         cf.write("logging_collector = off\n")
         cf.write("log_destination = 'stderr'\n")
-        # Disable Unix-domain socket creation.  The Bazel sandbox mounts
-        # /var/run/postgresql read-only, and the sandbox path is too deep for
-        # the 107-byte socket-path limit anyway.  We connect exclusively via
-        # TCP (PGHOST=127.0.0.1), so Unix sockets are not needed.
         cf.write("unix_socket_directories = ''\n")
 
-    # -- Start server --------------------------------------------------------
     start_cmd = [pg_ctl, "start", "-D", pgdata, "-l", pg_log, "-w"]
     if use_socket_fd:
-        # Pass the already-bound fd to eliminate TOCTOU.
         start_cmd += ["-o", f"--socket-fd={reserved_sock.fileno()}"]
-
-    proc = None
-
-    def _stop_server() -> None:
-        _log("Stopping Postgres …")
-        subprocess.run(
-            [pg_ctl, "stop", "-D", pgdata, "-m", "fast", "-w"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    atexit.register(_stop_server)
 
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
@@ -312,8 +287,6 @@ def main() -> None:
                                stdout=subprocess.DEVNULL, env=pg_run_env)
                 reserved_sock.close()
             else:
-                # Close the reserved socket just before starting so Postgres
-                # can bind the same port (small race, retried on failure).
                 if reserved_sock:
                     reserved_sock.close()
                 subprocess.run(start_cmd, check=True, stdout=subprocess.DEVNULL,
@@ -324,7 +297,6 @@ def main() -> None:
             break
         except (subprocess.CalledProcessError, TimeoutError) as exc:
             _log(f"Attempt {attempt} failed: {exc}")
-            # Dump the log for diagnosis.
             log_content = ""
             if os.path.exists(pg_log):
                 with open(pg_log) as lf:
@@ -335,31 +307,24 @@ def main() -> None:
                     _log("Server log:\n" + log_content)
                 sys.exit(1)
 
-            # Only retry for TCP port-binding conflicts — all other errors
-            # (config errors, permission problems, missing files) are fatal.
             if log_content and not _is_port_conflict(pg_log):
                 _log("Non-retriable error detected. Server log:\n" + log_content)
                 sys.exit(1)
 
-            # Re-allocate port and retry.
             port, reserved_sock = _allocate_port()
             use_socket_fd = 14 <= actual_pg_version <= 17 and reserved_sock is not None
-            # Update postgresql.conf with new port.
             with open(conf_path, "a") as cf:
-                cf.write(f"port = {port}\n")  # last value wins in PG config
+                cf.write(f"port = {port}\n")
 
-    # -- Create database and user --------------------------------------------
     _log(f"Creating database '{database}'")
     _psql(psql_bin, host, port, pg_user, "postgres", pg_password,
           sql=f"CREATE DATABASE \"{database}\";", lib_dir=pg_lib_dir)
 
-    # -- Apply migrations ----------------------------------------------------
     for migration in migrations:
         _log(f"Applying migration: {os.path.basename(migration)}")
         _psql(psql_bin, host, port, pg_user, database, pg_password,
               file=migration, lib_dir=pg_lib_dir)
 
-    # -- Load seed data ------------------------------------------------------
     for seed_file in seed_files:
         ext = os.path.splitext(seed_file)[1].lower()
         _log(f"Loading seed: {os.path.basename(seed_file)}")
@@ -372,24 +337,118 @@ def main() -> None:
         else:
             _log(f"Warning: unknown seed file type '{ext}', skipping.")
 
-    # -- Exec test binary ----------------------------------------------------
+    return _PgState(
+        pgdata      = pgdata,
+        pg_log      = pg_log,
+        pg_ctl      = pg_ctl,
+        pg_lib_dir  = pg_lib_dir,
+        host        = host,
+        port        = port,
+        database    = database,
+        pg_user     = pg_user,
+        pg_password = pg_password,
+        psql        = psql_bin,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _stop_cluster: shared teardown
+# ---------------------------------------------------------------------------
+
+def _stop_cluster(state: _PgState) -> None:
+    _log("Stopping Postgres …")
+    subprocess.run(
+        [state.pg_ctl, "stop", "-D", state.pgdata, "-m", "fast", "-w"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# main_test: pg_setup → exec test binary
+#
+# atexit is registered as a best-effort stop.  os.execve replaces the process
+# image so Python's atexit handlers do not fire after the execve'd binary
+# exits; the cluster is cleaned up when Bazel removes TEST_TMPDIR.
+# ---------------------------------------------------------------------------
+
+def main_test(m: dict) -> None:
+    state = _pg_setup(m)
+    atexit.register(_stop_cluster, state)
+
     test_binary = os.environ.get("RULES_PG_TEST_BINARY")
     if not test_binary:
         sys.exit("[rules_pg] RULES_PG_TEST_BINARY not set")
-    test_binary = _find_runfile(test_binary, workspace) if not os.path.isabs(test_binary) else test_binary
+    workspace = m.get("workspace", "")
+    if not os.path.isabs(test_binary):
+        test_binary = _find_runfile(test_binary, workspace)
 
-    env = _pg_env(pg_lib_dir)
-    env["PGHOST"]     = host
-    env["PGPORT"]     = str(port)
-    env["PGDATABASE"] = database
-    env["PGUSER"]     = pg_user
-    env["PGPASSWORD"] = pg_password
+    env = _pg_env(state.pg_lib_dir)
+    env["PGHOST"]     = state.host
+    env["PGPORT"]     = str(state.port)
+    env["PGDATABASE"] = state.database
+    env["PGUSER"]     = state.pg_user
+    env["PGPASSWORD"] = state.pg_password
 
     _log(f"Executing test binary: {test_binary}")
     os.execve(test_binary, [test_binary] + sys.argv[1:], env)
-    # atexit teardown runs after the child exits (because execve replaces us,
-    # so teardown runs in the *parent* — the wrapper shell — via the atexit
-    # registered above, which Python fires before the final exit).
+
+
+# ---------------------------------------------------------------------------
+# main_server: pg_setup → write env file → block until SIGTERM/SIGINT
+#
+# The env file is written only after _pg_setup returns (cluster fully ready,
+# all migrations and seeds applied).  Its existence is the readiness signal
+# consumed by pg_health_check.
+# ---------------------------------------------------------------------------
+
+def main_server(m: dict) -> None:
+    output_env_file = os.environ.get("RULES_PG_OUTPUT_ENV_FILE")
+    if not output_env_file:
+        sys.exit("[rules_pg] RULES_PG_OUTPUT_ENV_FILE not set")
+
+    state = _pg_setup(m)
+
+    # Write connection details for consumers.  Written atomically (to a temp
+    # file then renamed) so readers never observe a partial write.
+    tmp = output_env_file + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"PGHOST={state.host}\n")
+        f.write(f"PGPORT={state.port}\n")
+        f.write(f"PGDATABASE={state.database}\n")
+        f.write(f"PGUSER={state.pg_user}\n")
+        f.write(f"PGPASSWORD={state.pg_password}\n")
+    os.replace(tmp, output_env_file)
+    _log(f"Connection details written to {output_env_file}")
+
+    def _handle_shutdown(signum, frame):
+        _stop_cluster(state)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
+    _log("PostgreSQL server ready. Waiting for shutdown signal.")
+    while True:
+        signal.pause()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    manifest_path = os.environ.get("RULES_PG_MANIFEST")
+    if not manifest_path:
+        sys.exit("[rules_pg] RULES_PG_MANIFEST not set")
+    with open(manifest_path) as f:
+        m = json.load(f)
+
+    mode = os.environ.get("RULES_PG_MODE", "test")
+    if mode == "server":
+        main_server(m)
+    else:
+        main_test(m)
 
 
 if __name__ == "__main__":

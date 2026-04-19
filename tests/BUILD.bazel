@@ -1,4 +1,4 @@
-load("@rules_pg//:defs.bzl", "pg_test", "pg_seed_data", "postgres_schema")
+load("@rules_pg//:defs.bzl", "pg_health_check", "pg_seed_data", "pg_server", "pg_test", "postgres_schema")
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -126,5 +126,49 @@ pg_test(
     pg_user = "myapp",
     pg_password = "secret",
     size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# pg_server + pg_health_check fixtures used by the server-mode tests below
+# ---------------------------------------------------------------------------
+
+pg_server(
+    name = "pg_server_test_svc",
+    schema = ":test_schema",
+    seed = ":test_seed",
+)
+
+pg_health_check(
+    name = "pg_server_test_health",
+    server = ":pg_server_test_svc",
+)
+
+# ---------------------------------------------------------------------------
+# Tests: pg_server lifecycle
+#   - starts cluster, writes env file, schema + seed applied, SIGTERM clean exit
+# ---------------------------------------------------------------------------
+
+sh_test(
+    name = "pg_server_test",
+    srcs = ["pg_server_test.sh"],
+    args = ["$(rootpath :pg_server_test_svc)"],
+    data = [":pg_server_test_svc"],
+    size = "medium",
+    tags = ["pg"],
+)
+
+# ---------------------------------------------------------------------------
+# Tests: pg_health_check script
+#   - exits non-zero without env file, exits 0 with it
+#   Does not start a real server; manipulates the env file directly.
+# ---------------------------------------------------------------------------
+
+sh_test(
+    name = "pg_health_check_test",
+    srcs = ["pg_health_check_test.sh"],
+    args = ["$(rootpath :pg_server_test_health)"],
+    data = [":pg_server_test_health"],
+    size = "small",
     tags = ["pg"],
 )
