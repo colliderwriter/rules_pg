@@ -327,6 +327,8 @@ rules_itest service manager
 bazel test //tests/...
 ```
 
+All tests must pass before any commit is made.
+
 ### Test results (last full run: 2026-04-18)
 
 All 10 tests pass on Linux x86_64 with PostgreSQL 18.3 system install.
